@@ -211,6 +211,33 @@ The fix matches the per-entity convention: **each surface gets its own `<entity>
 
 Sweep heuristic (`RULE_self-sweep` defensive-code sweep): a new shell template adding `<script src="…/<otherentity>_actions.js">` is the smell. Grep the included file's first `if (payload.type !== …)` line; if the literal doesn't match the new surface's type, it's a dead include.
 
+### Resolving the trap at scale — one convention-driven listener, loaded globally
+
+Once you hit ~3 entities (article + event + faq), stop copying per-entity files and **collapse to a single generic listener** — and the lever that makes it clean is that the per-entity files differ *only* by a type token and selectors that already follow a **convention** (`.<type>-detail-body`, `[data-<type>-title-hint]`, frame types `<type>` / `<type>-edit`). Derive those from the `entityChanged` payload's `type` instead of hard-coding them:
+
+```js
+function onEntityChanged(event) {
+    var payload = event.detail || {};
+    var type = payload.type;                 // 'article' | 'event' | 'faq' | …
+    if (!type) return;
+    if (payload.action === 'saved')   onSaveCosmetics(type);
+    else if (payload.action === 'deleted') onDelete(type, payload);
+}
+function onSaveCosmetics(type) {
+    var body = document.querySelector('.' + type + '-detail-body');
+    if (!body) return;                       // surface not following the convention → no-op
+    var hint = body.querySelector('[data-' + type + '-title-hint]');
+    // … mutate stack top title …
+}
+```
+
+Payoff: a **new** surface that follows the convention gets drawer-close + title-on-save for free — **nothing to register**, no per-entity file to forget. (This is also what kills the hard-gate trap above: there's no type-gate to mismatch, and no per-entity `<script>` to mis-include.) `RULE_rename-before-drop`: add the generic listener + switch the loading, verify green, then drop the old per-entity files.
+
+Two non-obvious requirements when you consolidate:
+
+1. **Load it GLOBALLY (from the base shell template), NOT per-shell `{% block extra_js %}`.** Shell-nav hot-swaps replace only the swap-target region; a per-shell `extra_js` script never loads when the user arrives at that surface via *cross-surface* shell-nav. A globally-loaded listener survives nav. (The per-entity files were per-shell — which means the old approach was *also* silently broken after cross-surface nav, not just the reuse case. Heavy surface-specific assets that genuinely can't be global — mermaid, rich-text editors — need a separate load-on-nav loader; that's a distinct concern from this always-on listener.)
+2. **Register on `document`, NOT `document.body`** — see [`ALPINE_HTMX_GOTCHAS.md`](ALPINE_HTMX_GOTCHAS.md) §11 for the always-exists / `body`-null-crash rationale. Drawer-specific deltas: it catches an `entityChanged` dispatched directly on `document`, and `{capture: true}` fires it in the capture phase ahead of the bubble-phase refresh-walker — match whatever target the walker uses (walker on `document` → listener on `document` too). **Self-sweep note:** when porting an old listener faithfully, re-check the *target* — copying `document.body` from the files being consolidated carried the latent crash forward until review caught it.
+
 ### Empty-snapshot fallback in pop / popstate handlers
 
 Cold-loading via `?open=parent&push=child` renders only the TOP frame's body — parent frames' snapshots are empty. Browser back at depth>1 then restores an empty body. Guard in both `store.pop()` and the popstate handler:
