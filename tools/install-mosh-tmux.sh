@@ -24,6 +24,10 @@
 #      outside those markers survives re-runs.
 #   4. Adds an SSH-only auto-attach snippet to `~/.bashrc` (also
 #      marker-bounded) so every SSH/mosh login drops straight into tmux.
+#      Each client gets its own session (the first un-attached one, else a
+#      fresh one) so a mosh window + an ssh window never share a session and
+#      fight over terminal size. Export TMUX_DEFAULT_SESSION to force the
+#      old single-shared-session behaviour.
 #   5. If ufw is active, opens UDP 60000:61000 (mosh's default port range).
 #   6. Prints a client-side reminder (mosh needs a mosh-client on the
 #      laptop end too).
@@ -417,14 +421,35 @@ if [ "$DO_AUTOATTACH" = "1" ]; then
     # per invocation (bugbot PR #59 LOW 3120687473).
     cat >> "$BASHRC" <<BASHRCBLOCK
 $BEGIN_MARK
-# Auto-attach to tmux on SSH (incl. mosh) login, creating the session if
-# it doesn't exist yet. Skips non-SSH shells, nested tmux, and non-interactive
-# shells (so scp/rsync/cron aren't affected).
-# Override the session name by exporting TMUX_DEFAULT_SESSION before login.
+# Auto-attach to tmux on SSH (incl. mosh) login. Skips non-SSH shells, nested
+# tmux, and non-interactive shells (so scp/rsync/cron aren't affected).
+#
+# Independent-window mode (default): each client gets its OWN session. We
+# attach to the first session that has no client attached; if every session
+# is already in use (or none exist yet), we create a fresh one. This stops
+# two clients — e.g. a mosh window AND an ssh window open at once — from
+# sharing one session and fighting over terminal size, which paints the
+# larger window full of "······" filler and duplicates the status line.
+# Detached sessions are reused on the next login, so nothing is orphaned.
+#
+# Shared-session opt-in: export TMUX_DEFAULT_SESSION=name before login to
+# force every client onto one named session (the old shared behaviour).
 if [ -z "\$TMUX" ] && [ -n "\$SSH_CONNECTION" ] && [ -t 0 ] && command -v tmux >/dev/null 2>&1; then
-    _mv_session="\${TMUX_DEFAULT_SESSION:-$SESSION_NAME}"
-    tmux attach -t "\$_mv_session" 2>/dev/null || tmux new-session -s "\$_mv_session"
-    unset _mv_session
+    if [ -n "\$TMUX_DEFAULT_SESSION" ]; then
+        tmux attach -t "\$TMUX_DEFAULT_SESSION" 2>/dev/null \
+            || tmux new-session -s "\$TMUX_DEFAULT_SESSION"
+    else
+        _mv_free=\$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null \
+            | awk '\$1==0 {print \$2; exit}')
+        if [ -n "\$_mv_free" ]; then
+            tmux attach -t "\$_mv_free"
+        else
+            # First session keeps the friendly name; later concurrent clients
+            # get tmux's auto-numbered names (the -s name is already taken).
+            tmux new-session -s "$SESSION_NAME" 2>/dev/null || tmux new-session
+        fi
+        unset _mv_free
+    fi
 fi
 $END_MARK
 BASHRCBLOCK
@@ -492,7 +517,8 @@ MOSH_VER_LINE=${MOSH_VER%%$'\n'*}
 echo "   mosh: ${MOSH_VER_LINE:-installed}"
 echo "   tmux: $(tmux -V)"
 if [ "$DO_AUTOATTACH" = "1" ]; then
-    echo "   session auto-attach: $SESSION_NAME  (override via \$TMUX_DEFAULT_SESSION)"
+    echo "   session auto-attach: per-client (first '$SESSION_NAME', then auto-named)"
+    echo "                        force one shared session via \$TMUX_DEFAULT_SESSION"
 fi
 echo ""
 echo "Next steps:"
@@ -505,12 +531,16 @@ echo "       mosh $TARGET_USER@<server-host>"
 echo "     (or keep ssh — tmux alone still survives ssh drops, mosh just adds"
 echo "      seamless roaming on top)."
 if [ "$DO_AUTOATTACH" = "1" ]; then
-    echo "  3. First login auto-attaches to session '$SESSION_NAME'."
+    echo "  3. Each login attaches to its own session: the first un-attached one,"
+    echo "     else a fresh one ('$SESSION_NAME', then tmux auto-names later concurrent"
+    echo "     clients). So a mosh window + an ssh window won't share a session and"
+    echo "     fight over terminal size. Force one shared session: export"
+    echo "     TMUX_DEFAULT_SESSION=name before connecting."
     if [ "$DO_TMUX_CONFIG" = "1" ]; then
-        echo "     Detach with Ctrl-a d; re-attach manually with: tmux attach -t $SESSION_NAME"
+        echo "     Detach with Ctrl-a d; list sessions with: tmux ls"
         echo "     (prefix is C-a, remapped from C-b — IDE terminals grab C-b for sidebar)"
     else
-        echo "     Detach with <your-prefix> d; re-attach manually with: tmux attach -t $SESSION_NAME"
+        echo "     Detach with <your-prefix> d; list sessions with: tmux ls"
         echo "     (--no-tmux-config: prefix is whatever your existing ~/.tmux.conf sets,"
         echo "      or tmux's default C-b if you have none)"
     fi
